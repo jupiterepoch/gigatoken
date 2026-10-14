@@ -313,13 +313,50 @@ fn pack_nibbles(classes: &[u8]) -> Box<[u8]> {
         .collect()
 }
 
+/// Oniguruma (used by HF tokenizers) has Unicode 16 general categories.
+/// Keep this table separate from ICU's newer data used by other schemes.
+static O200K_UNICODE16_CLASS_TABLE: std::sync::LazyLock<Box<[u8]>> =
+    std::sync::LazyLock::new(|| {
+        use unicode_general_category::{GeneralCategory as G, get_general_category};
+        let mut classes = vec![O200kCharClass::Other as u8; 0x110000];
+        for (cp, slot) in classes.iter_mut().enumerate() {
+            let Some(c) = char::from_u32(cp as u32) else {
+                continue;
+            };
+            *slot = match get_general_category(c) {
+                G::UppercaseLetter | G::TitlecaseLetter => O200kCharClass::Upper,
+                G::LowercaseLetter => O200kCharClass::Lower,
+                G::ModifierLetter | G::OtherLetter => O200kCharClass::Caseless,
+                G::NonspacingMark | G::SpacingMark | G::EnclosingMark => O200kCharClass::Mark,
+                G::DecimalNumber | G::LetterNumber | G::OtherNumber => O200kCharClass::Number,
+                _ => O200kCharClass::Other,
+            } as u8;
+        }
+        // White_Space has not changed between these Unicode versions.
+        for range in CodePointSetData::new::<WhiteSpace>().iter_ranges() {
+            classes[*range.start() as usize..=*range.end() as usize]
+                .fill(O200kCharClass::Whitespace as u8);
+        }
+        pack_nibbles(&classes)
+    });
+
+#[inline(always)]
+pub(crate) fn o200k_unicode16_class_of(cp: u32) -> O200kCharClass {
+    o200k_table_class_of(&O200K_UNICODE16_CLASS_TABLE, cp)
+}
+
 /// Classify a codepoint for the o200k scheme family with one table load.
 /// `cp` must be a valid scalar value (guaranteed when decoded from valid
 /// UTF-8).
 #[inline(always)]
 pub(crate) fn o200k_class_of(cp: u32) -> O200kCharClass {
+    o200k_table_class_of(&O200K_CLASS_TABLE, cp)
+}
+
+#[inline(always)]
+fn o200k_table_class_of(table: &[u8], cp: u32) -> O200kCharClass {
     debug_assert!(cp < 0x110000);
-    let byte = unsafe { *O200K_CLASS_TABLE.get_unchecked((cp >> 1) as usize) };
+    let byte = unsafe { *table.get_unchecked((cp >> 1) as usize) };
     match (byte >> ((cp & 1) << 2)) & 0xF {
         0 => O200kCharClass::Upper,
         1 => O200kCharClass::Lower,
@@ -448,6 +485,18 @@ mod tests {
     use super::*;
 
     /// The packed table must agree with the ICU predicates for every scalar.
+    #[test]
+    fn nemotron_classes_match_hf_unicode16() {
+        // FNV-1a over every codepoint's class, generated independently by
+        // tokenizers' Oniguruma regexes in test_hf_unicode_categories.
+        let mut fingerprint = 0xcbf29ce484222325u64;
+        for cp in 0..0x110000 {
+            fingerprint ^= o200k_unicode16_class_of(cp) as u64;
+            fingerprint = fingerprint.wrapping_mul(0x100000001b3);
+        }
+        assert_eq!(fingerprint, 0x285a662543293a3b);
+    }
+
     #[test]
     fn class_table_matches_icu() {
         for cp in 0..=char::MAX as u32 {

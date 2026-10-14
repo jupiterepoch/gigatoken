@@ -17,8 +17,13 @@ import time
 import unicodedata
 from pathlib import Path
 
+import awkward as ak
 import numpy as np
 import pytest
+from tokenizers import Regex, decoders, models, pre_tokenizers, trainers
+from tokenizers import Tokenizer as HFTokenizer
+
+import gigatoken
 
 OWT_PATH = Path.home() / "data" / "owt_train.txt"
 SLAB_BYTES = int(os.environ.get("OWT_SLAB_BYTES", 64 * 1024 * 1024))
@@ -268,3 +273,50 @@ def test_owt_matches_hf(hf_tok, gigatoken_tok):
         f"{total_tokens} tokens, all identical to HF."
     )
     assert total_docs > 0
+
+
+NEMOTRON_REGEX = (
+    r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+|"
+    r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*|"
+    r"\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+"
+)
+
+
+def test_hf_unicode16_boundaries():
+    # Unicode 17 numbers/letters/marks and Unicode 16 upper/lowercase letters.
+    chars = [chr(cp) for cp in [0x11DE0, 0x16FF4, 0xA7CE, 0xA7CF, 0x1ACF, 0x1E6E3, 0x1C89, 0x1C8A]]
+    texts = [f"{'a' * n}aa{c}bb 12{c}34 !{c}!" for c in chars for n in range(70)]
+    hf = HFTokenizer(models.BPE(ignore_merges=True))
+    hf.pre_tokenizer = pre_tokenizers.Sequence([
+        pre_tokenizers.Split(Regex(NEMOTRON_REGEX), behavior="isolated"),
+        pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=False),
+    ])
+    hf.decoder = decoders.ByteLevel()
+    hf.train_from_iterator(
+        texts,
+        trainers.BpeTrainer(vocab_size=1024, initial_alphabet=pre_tokenizers.ByteLevel.alphabet(), show_progress=False),
+    )
+    native = gigatoken.Tokenizer(hf)
+    expected = [hf.encode(text).ids for text in texts]
+    for parallel in [False, True, False]:
+        assert ak.to_list(native.encode_batch(texts, parallel=parallel)) == expected
+    for text, ids in zip(texts, expected):
+        assert native.encode(text).tolist() == ids
+
+
+def test_hf_unicode_categories():
+    # Fingerprint all six classes used by Nemotron, including unassigned
+    # codepoints. The Rust table test checks the same value independently.
+    text = "".join(chr(cp) for cp in range(0x110000) if not 0xD800 <= cp <= 0xDFFF)
+    classes = bytearray([6]) * 0x110000
+    for code, pattern in enumerate([r"[\p{Lu}\p{Lt}]", r"\p{Ll}", r"[\p{Lm}\p{Lo}]", r"\p{M}", r"\p{N}", r"\s"]):
+        matched = bytearray([1]) * len(text)
+        for _, (start, end) in pre_tokenizers.Split(Regex(pattern), behavior="removed").pre_tokenize_str(text):
+            matched[start:end] = bytes(end - start)
+        for index, is_match in enumerate(matched):
+            if is_match:
+                classes[index if index < 0xD800 else index + 0x800] = code
+    fingerprint = 0xCBF29CE484222325
+    for value in classes:
+        fingerprint = ((fingerprint ^ value) * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
+    assert fingerprint == 0x285A662543293A3B, "HF Unicode properties changed; update the Rust table and oracle together"

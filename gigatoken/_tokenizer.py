@@ -104,7 +104,7 @@ class Tokenizer:
         o200k_base) both are taken from the file's name. For any other rank
         file, name the scheme: `pretokenizer` is one of "gpt2"/"r50k",
         "gpt4"/"cl100k", "o200k", "qwen2", "qwen35", "olmo3", "deepseek_v3",
-        "nemotron" or "kimi", and `special_tokens` maps token content to id
+        "nemotron", "nemotron_right_aligned" or "kimi", and `special_tokens` maps token content to id
         (none by default). Passing `pretokenizer` skips the file-name lookup
         entirely; nothing is ever guessed — an unrecognized file name with no
         `pretokenizer` raises rather than silently mistokenizing.

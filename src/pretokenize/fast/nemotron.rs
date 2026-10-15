@@ -7,9 +7,18 @@
 
 use super::mask::{MaskScheme, MaskState};
 use super::o200k_family;
+use super::{decode_cp, is_digit};
 use crate::pretokenize::Pretoken;
+use crate::pretokenize::unicode::{O200kCharClass, o200k_class_of};
 
 pub(crate) struct NemotronScheme;
+
+impl NemotronScheme {
+    #[inline(always)]
+    fn class_of(cp: u32) -> O200kCharClass {
+        o200k_class_of(cp)
+    }
+}
 
 impl MaskScheme for NemotronScheme {
     #[inline(always)]
@@ -71,13 +80,109 @@ impl<'a> Iterator for FastNemotronPretokenizer<'a> {
 
 super::impl_mask_pretoken_spans!(FastNemotronPretokenizer, NemotronScheme);
 
+/// Right-aligned Unicode Number groups of up to three; all other spans use
+/// the existing Nemotron scanner. Only this iterator carries grouping state.
+pub struct FastNemotronRightAlignedPretokenizer<'a> {
+    bytes: &'a [u8],
+    state: MaskState,
+    numbers_left: usize,
+}
+
+impl<'a> FastNemotronRightAlignedPretokenizer<'a> {
+    #[inline]
+    pub fn new(bytes: &'a [u8]) -> Self {
+        Self::with_pos(bytes, 0)
+    }
+
+    /// Resume at a byte offset previously returned by [`Self::pos`].
+    #[inline]
+    pub fn with_pos(bytes: &'a [u8], pos: usize) -> Self {
+        Self {
+            bytes,
+            state: MaskState::new(pos),
+            numbers_left: 0,
+        }
+    }
+
+    #[inline]
+    pub fn pos(&self) -> usize {
+        self.state.pos
+    }
+
+    #[inline(always)]
+    fn number_end(&self, pos: usize) -> Option<usize> {
+        let &b = self.bytes.get(pos)?;
+        if b < 0x80 {
+            return is_digit(b).then_some(pos + 1);
+        }
+        // SAFETY: pos < len and b is non-ASCII; decode_cp checks the tail.
+        let (cp, width) = unsafe { decode_cp(self.bytes, pos) };
+        (NemotronScheme::class_of(cp) == O200kCharClass::Number).then_some(pos + width)
+    }
+
+    #[inline(always)]
+    fn next_span(&mut self) -> Option<(usize, usize)> {
+        let start;
+        if self.numbers_left == 0 {
+            let span = self.state.next_span::<NemotronScheme>(self.bytes)?;
+            let Some(mut end) = self.number_end(span.0) else {
+                return Some(span);
+            };
+            start = span.0;
+            self.numbers_left = 1;
+            // Count the complete run once. The first group is the remainder;
+            // the remaining groups each contain three Unicode codepoints.
+            while let Some(next) = self.number_end(end) {
+                end = next;
+                self.numbers_left += 1;
+            }
+        } else {
+            start = self.state.pos;
+        }
+        let count = (self.numbers_left - 1) % 3 + 1;
+        let mut end = start;
+        for _ in 0..count {
+            end = self.number_end(end).expect("counted number run");
+        }
+        self.numbers_left -= count;
+        // Discard single-number boundaries cached inside this run.
+        self.state = MaskState::new(end);
+        Some((start, end))
+    }
+}
+
+impl<'a> Iterator for FastNemotronRightAlignedPretokenizer<'a> {
+    type Item = Pretoken<'a>;
+
+    #[inline]
+    fn next(&mut self) -> Option<Pretoken<'a>> {
+        let (start, end) = self.next_span()?;
+        Some(Pretoken(&self.bytes[start..end]))
+    }
+}
+
+// SAFETY: next_span emits only live, nonempty spans within self.bytes.
+unsafe impl<'a> crate::pretokenize::PretokenSpans<'a> for FastNemotronRightAlignedPretokenizer<'a> {
+    #[inline]
+    fn fill_spans_keyed(
+        &mut self,
+        batch: &mut crate::pretokenize::SpanBatch<'a>,
+        prefetch: &impl Fn(u64),
+    ) -> usize {
+        let bytes = self.bytes;
+        crate::pretokenize::fill_spans_keyed_with_buf(bytes, || self.next_span(), batch, prefetch)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pretokenize::{PretokenSpans, SpanBatch, safe_split_ranges};
 
     /// The Nemotron pattern verbatim — no possessive quantifiers, so it
     /// runs directly under fancy-regex.
     const NEMOTRON_REF_REGEX: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+    const NEMOTRON_RIGHT_ALIGNED_REF_REGEX: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*|\p{N}{1,3}(?=(?:\p{N}{3})*(?!\p{N}))|\p{N}{1,2}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
     fn regex_tokens(s: &str) -> Vec<String> {
         let re = fancy_regex::Regex::new(NEMOTRON_REF_REGEX).unwrap();
@@ -134,5 +239,88 @@ mod tests {
                 "Mismatch on round {round}, case {s:?}"
             );
         }
+    }
+
+
+    fn assert_right_aligned_reference(text: &str) {
+        static RE: std::sync::OnceLock<fancy_regex::Regex> = std::sync::OnceLock::new();
+        let re = RE.get_or_init(|| fancy_regex::Regex::new(NEMOTRON_RIGHT_ALIGNED_REF_REGEX).unwrap());
+        let expected: Vec<&[u8]> = re
+            .find_iter(text)
+            .map(|m| m.unwrap().as_str().as_bytes())
+            .collect();
+        let actual: Vec<&[u8]> = FastNemotronRightAlignedPretokenizer::new(text.as_bytes())
+            .map(|p| p.0)
+            .collect();
+        assert_eq!(actual, expected, "{text:?}");
+        let mut scanner = FastNemotronRightAlignedPretokenizer::new(text.as_bytes());
+        let mut batch = SpanBatch::new();
+        let mut filled = Vec::new();
+        loop {
+            let n = scanner.fill_spans_keyed(&mut batch, &|_| {});
+            if n == 0 {
+                break;
+            }
+            for i in 0..n {
+                // SAFETY: i was initialized by the immediately preceding fill.
+                filled.push(unsafe { batch.span(i) });
+            }
+        }
+        assert_eq!(filled, expected);
+    }
+
+    #[test]
+    fn right_aligned_numbers_and_vector_edges() {
+        for n in 1..130 {
+            for prefix in 0..70 {
+                assert_right_aligned_reference(&format!("{} {} suffix", "a".repeat(prefix), "1".repeat(n)));
+            }
+        }
+        for text in [
+            "١٢٣٤٥٦٧",
+            "１２３４５",
+            "ⅧⅡⅣⅦⅤ",
+            "½¼¾⅓⅔",
+            "1٢３Ⅷ½4٥6",
+            "cafe\u{301}A 1234\r\n//abc",
+        ] {
+            assert_right_aligned_reference(text);
+        }
+    }
+
+    #[test]
+    fn right_aligned_random_reference() {
+        use rand::prelude::*;
+        let pool: Vec<char> = "aAZz019 \r\n\t.,/'éßЖا한日١２Ⅷ½\u{301}🌍".chars().collect();
+        let mut rng = StdRng::seed_from_u64(420);
+        for _ in 0..3000 {
+            let n = rng.random_range(1..120);
+            let text: String = (0..n).map(|_| *pool.choose(&mut rng).unwrap()).collect();
+            assert_right_aligned_reference(&text);
+        }
+    }
+
+    #[test]
+    fn right_aligned_long_run_and_safe_cuts() {
+        let text = "1".repeat(100_001);
+        let groups: Vec<_> = FastNemotronRightAlignedPretokenizer::new(text.as_bytes())
+            .map(|p| p.0)
+            .collect();
+        assert_eq!(groups[0].len(), 2);
+        assert!(groups[1..].iter().all(|p| p.len() == 3));
+        assert_eq!(groups.concat(), text.as_bytes());
+        let text = "alpha 1234567 beta ١٢٣٤٥٦٧ gamma\n".repeat(1000);
+        let whole: Vec<_> = FastNemotronRightAlignedPretokenizer::new(text.as_bytes())
+            .map(|p| p.0)
+            .collect();
+        let ranges = safe_split_ranges(text.as_bytes(), 100, &[]);
+        assert!(ranges.len() > 1);
+        let fragments: Vec<_> = ranges
+            .iter()
+            .flat_map(|r| {
+                FastNemotronRightAlignedPretokenizer::new(&text.as_bytes()[r.clone()]).map(|p| p.0)
+            })
+            .collect();
+        assert_eq!(whole, fragments);
     }
 }

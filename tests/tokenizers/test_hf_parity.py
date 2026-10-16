@@ -268,3 +268,48 @@ def test_owt_matches_hf(hf_tok, gigatoken_tok):
         f"{total_tokens} tokens, all identical to HF."
     )
     assert total_docs > 0
+
+
+@pytest.fixture(scope="module")
+def nemotron_right_aligned_hf():
+    reference = os.environ.get("HF_REFERENCE_TOKENIZER")
+    if reference is None:
+        pytest.skip("set HF_REFERENCE_TOKENIZER to the full HF reference directory")
+    from transformers import AutoTokenizer
+
+    hf = AutoTokenizer.from_pretrained(reference, use_fast=True, trust_remote_code=False, local_files_only=True)
+    assert [span for span, _ in hf.backend_tokenizer.pre_tokenizer.pre_tokenize_str("1234567")] == ["1", "234", "567"]
+    return hf
+
+
+def test_nemotron_right_aligned_matches_hf(nemotron_right_aligned_hf):
+    import awkward as ak
+
+    import gigatoken
+
+    hf = nemotron_right_aligned_hf
+    native = gigatoken.Tokenizer(hf)
+    texts = TEXTS + SPECIAL_TEXTS + [f"prefix {digit * n} suffix" for digit in ["1", "٢", "３", "Ⅷ", "½"] for n in range(1, 130)] + ["1٢３Ⅷ½4٥6", "cafe\u0301A 1234\r\n//abc"]
+    expected = [hf.encode(text, add_special_tokens=False) for text in texts]
+    for parallel in [False, True, False, True]:
+        assert ak.to_list(native.encode_batch(texts, parallel=parallel)) == expected
+    for text, ids in zip(texts, expected):
+        _assert_ids_match(hf.backend_tokenizer, native, text)
+        assert native.decode(ids) == hf.decode(ids, skip_special_tokens=False, clean_up_tokenization_spaces=False).encode()
+
+
+def test_nemotron_right_aligned_large_document(nemotron_right_aligned_hf, tmp_path):
+    import awkward as ak
+
+    import gigatoken
+
+    hf = nemotron_right_aligned_hf
+    native = gigatoken.Tokenizer(hf)
+    text = "alpha 1234567 beta ١٢٣٤٥٦٧ gamma\n" * 100_000
+    expected = hf.encode(text, add_special_tokens=False)
+    assert native.encode(text).tolist() == expected
+    for parallel in [False, True]:
+        assert ak.to_list(native.encode_batch([text], parallel=parallel)) == [expected]
+        path = tmp_path / "numbers.txt"
+        path.write_text(text)
+        assert ak.to_list(native.encode_files(path, parallel=parallel)) == [expected]
